@@ -1,5 +1,5 @@
 import { injectable, inject } from '@theia/core/shared/inversify';
-import * as fs from 'fs';
+import { promises as fs, realpath, lstat, Stats, constants, rm } from 'fs';
 import * as os from 'os';
 import * as temp from 'temp';
 
@@ -24,7 +24,6 @@ import {
   ArchiveSketchRequest,
   LoadSketchRequest,
 } from './cli-protocol/cc/arduino/cli/commands/v1/commands_pb';
-import { duration } from '../common/decorators';
 import * as glob from 'glob';
 import { Deferred } from '@theia/core/lib/common/promise-util';
 import { ServiceError } from './service-error';
@@ -41,6 +40,7 @@ export class SketchesServiceImpl
 {
   private sketchSuffixIndex = 1;
   private lastSketchBaseName: string;
+  private recentSketches: SketchWithDetails[] | undefined;
 
   @inject(ConfigServiceImpl)
   private readonly configService: ConfigServiceImpl;
@@ -54,28 +54,7 @@ export class SketchesServiceImpl
   @inject(IsTempSketch)
   private readonly isTempSketch: IsTempSketch;
 
-  async getSketches({
-    uri,
-    exclude,
-  }: {
-    uri?: string;
-    exclude?: string[];
-  }): Promise<SketchContainer> {
-    const [/*old,*/ _new] = await Promise.all([
-      // this.getSketchesOld({ uri, exclude }),
-      this.getSketchesNew({ uri, exclude }),
-    ]);
-    return _new;
-  }
-
-  @duration()
-  async getSketchesNew({
-    uri,
-    exclude,
-  }: {
-    uri?: string;
-    exclude?: string[];
-  }): Promise<SketchContainer> {
+  async getSketches({ uri }: { uri?: string }): Promise<SketchContainer> {
     const root = await this.root(uri);
     const pathToAllSketchFiles = await new Promise<string[]>(
       (resolve, reject) => {
@@ -169,7 +148,7 @@ export class SketchesServiceImpl
       if (child) {
         child.sketches.push({
           name: sketchName,
-          uri: FileUri.create(pathToSketchFile).toString(),
+          uri: FileUri.create(path.dirname(pathToSketchFile)).toString(),
         });
       }
     }
@@ -191,8 +170,8 @@ export class SketchesServiceImpl
     const requestSketchPath = FileUri.fsPath(uri);
     req.setSketchPath(requestSketchPath);
     req.setInstance(instance);
-    const stat = new Deferred<fs.Stats | Error>();
-    fs.lstat(requestSketchPath, (err, result) =>
+    const stat = new Deferred<Stats | Error>();
+    lstat(requestSketchPath, (err, result) =>
       err ? stat.resolve(err) : stat.resolve(result)
     );
     const sketch = await new Promise<SketchWithDetails>((resolve, reject) => {
@@ -200,14 +179,7 @@ export class SketchesServiceImpl
         if (err) {
           reject(
             isNotFoundError(err)
-              ? SketchesError.NotFound(
-                  fixErrorMessage(
-                    err,
-                    requestSketchPath,
-                    this.configService.cliConfiguration?.directories.user
-                  ),
-                  uri
-                )
+              ? SketchesError.NotFound(err.details, uri)
               : err
           );
           return;
@@ -257,17 +229,27 @@ export class SketchesServiceImpl
       .then((uri) => path.join(FileUri.fsPath(uri), 'recent-sketches.json'));
   }
 
-  private async loadRecentSketches(
-    fsPath: string
-  ): Promise<Record<string, number>> {
+  private async loadRecentSketches(): Promise<Record<string, number>> {
+    const fsPath = await this.recentSketchesFsPath;
     let data: Record<string, number> = {};
+    const raw = await fs.readFile(fsPath, {
+      encoding: 'utf8',
+    });
     try {
-      const raw = await promisify(fs.readFile)(fsPath, {
-        encoding: 'utf8',
-      });
       data = JSON.parse(raw);
-    } catch {}
+    } catch (err) {
+      console.error(
+        `Could not parse recently opened sketches. Raw input was: ${raw}`
+      );
+    }
     return data;
+  }
+
+  private async saveRecentSketches(
+    data: Record<string, number>
+  ): Promise<void> {
+    const fsPath = await this.recentSketchesFsPath;
+    await fs.writeFile(fsPath, JSON.stringify(data, null, 2));
   }
 
   async markAsRecentlyOpened(uri: string): Promise<void> {
@@ -281,8 +263,7 @@ export class SketchesServiceImpl
       return;
     }
 
-    const fsPath = await this.recentSketchesFsPath;
-    const data = await this.loadRecentSketches(fsPath);
+    const data = await this.loadRecentSketches();
     const now = Date.now();
     data[sketch.uri] = now;
 
@@ -301,42 +282,48 @@ export class SketchesServiceImpl
       delete data[toDeleteUri];
     }
 
-    await promisify(fs.writeFile)(fsPath, JSON.stringify(data, null, 2));
-    this.recentlyOpenedSketches().then((sketches) =>
+    await this.saveRecentSketches(data);
+    this.recentlyOpenedSketches(true).then((sketches) =>
       this.notificationService.notifyRecentSketchesDidChange({ sketches })
     );
   }
 
-  async recentlyOpenedSketches(): Promise<Sketch[]> {
-    const configDirUri = await this.envVariableServer.getConfigDirUri();
-    const fsPath = path.join(
-      FileUri.fsPath(configDirUri),
-      'recent-sketches.json'
-    );
-    let data: Record<string, number> = {};
-    try {
-      const raw = await promisify(fs.readFile)(fsPath, {
-        encoding: 'utf8',
-      });
-      data = JSON.parse(raw);
-    } catch {}
-
-    const sketches: SketchWithDetails[] = [];
-    for (const uri of Object.keys(data).sort(
-      (left, right) => data[right] - data[left]
-    )) {
-      try {
-        const sketch = await this.loadSketch(uri);
-        sketches.push(sketch);
-      } catch {}
+  async recentlyOpenedSketches(forceUpdate?: boolean): Promise<Sketch[]> {
+    if (!this.recentSketches || forceUpdate) {
+      const data = await this.loadRecentSketches();
+      const sketches: SketchWithDetails[] = [];
+      let needsUpdate = false;
+      for (const uri of Object.keys(data).sort(
+        (left, right) => data[right] - data[left]
+      )) {
+        let sketch: SketchWithDetails | undefined = undefined;
+        try {
+          sketch = await this.loadSketch(uri);
+        } catch {}
+        if (!sketch) {
+          needsUpdate = true;
+        } else {
+          sketches.push(sketch);
+        }
+      }
+      if (needsUpdate) {
+        const data = sketches.reduce((acc, curr) => {
+          acc[curr.uri] = curr.mtimeMs;
+          return acc;
+        }, {} as Record<string, number>);
+        await this.saveRecentSketches(data);
+        this.notificationService.notifyRecentSketchesDidChange({ sketches });
+      }
+      this.recentSketches = sketches;
     }
-
-    return sketches;
+    return this.recentSketches;
   }
 
   async cloneExample(uri: string): Promise<Sketch> {
-    const sketch = await this.loadSketch(uri);
-    const parentPath = await this.createTempFolder();
+    const [sketch, parentPath] = await Promise.all([
+      this.loadSketch(uri),
+      this.createTempFolder(),
+    ]);
     const destinationUri = FileUri.create(
       path.join(parentPath, sketch.name)
     ).toString();
@@ -377,7 +364,7 @@ export class SketchesServiceImpl
         this.sketchSuffixIndex++
       )}`;
       // Note: we check the future destination folder (`directories.user`) for name collision and not the temp folder!
-      const sketchExists = await promisify(fs.exists)(
+      const sketchExists = await this.exists(
         path.join(sketchbookPath, sketchNameCandidate)
       );
       if (!sketchExists) {
@@ -424,7 +411,7 @@ void loop() {
           reject(createError);
           return;
         }
-        fs.realpath.native(dirPath, (resolveError, resolvedDirPath) => {
+        realpath.native(dirPath, (resolveError, resolvedDirPath) => {
           if (resolveError) {
             reject(resolveError);
             return;
@@ -478,7 +465,7 @@ void loop() {
     { destinationUri }: { destinationUri: string }
   ): Promise<string> {
     const source = FileUri.fsPath(sketch.uri);
-    const exists = await promisify(fs.exists)(source);
+    const exists = await this.exists(source);
     if (!exists) {
       throw new Error(`Sketch does not exist: ${sketch}`);
     }
@@ -520,7 +507,7 @@ void loop() {
     const destination = FileUri.fsPath(destinationUri);
     let tempDestination = await this.createTempFolder();
     tempDestination = path.join(tempDestination, sketch.name);
-    await fs.promises.mkdir(tempDestination, { recursive: true });
+    await fs.mkdir(tempDestination, { recursive: true });
     await copy(source, tempDestination);
     await copy(tempDestination, destination);
     return FileUri.create(destination).toString();
@@ -531,8 +518,8 @@ void loop() {
     const { client } = await this.coreClient;
     const archivePath = FileUri.fsPath(destinationUri);
     // The CLI cannot override existing archives, so we have to wipe it manually: https://github.com/arduino/arduino-cli/issues/1160
-    if (await promisify(fs.exists)(archivePath)) {
-      await promisify(fs.unlink)(archivePath);
+    if (await this.exists(archivePath)) {
+      await fs.unlink(archivePath);
     }
     const req = new ArchiveSketchRequest();
     req.setSketchPath(FileUri.fsPath(sketch.uri));
@@ -556,14 +543,14 @@ void loop() {
 
   async getIdeTempFolderPath(sketch: Sketch): Promise<string> {
     const sketchPath = FileUri.fsPath(sketch.uri);
-    await fs.promises.readdir(sketchPath); // Validates the sketch folder and rejects if not accessible.
+    await fs.readdir(sketchPath); // Validates the sketch folder and rejects if not accessible.
     const suffix = crypto.createHash('md5').update(sketchPath).digest('hex');
     return path.join(os.tmpdir(), `arduino-ide2-${suffix}`);
   }
 
   notifyDeleteSketch(sketch: Sketch): void {
     const sketchPath = FileUri.fsPath(sketch.uri);
-    fs.rm(sketchPath, { recursive: true, maxRetries: 5 }, (error) => {
+    rm(sketchPath, { recursive: true, maxRetries: 5 }, (error) => {
       if (error) {
         console.error(`Failed to delete sketch at ${sketchPath}.`, error);
       } else {
@@ -571,40 +558,19 @@ void loop() {
       }
     });
   }
+
+  private async exists(pathLike: string): Promise<boolean> {
+    try {
+      await fs.access(pathLike, constants.R_OK | constants.W_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 interface SketchWithDetails extends Sketch {
   readonly mtimeMs: number;
-}
-
-// https://github.com/arduino/arduino-cli/issues/1797
-function fixErrorMessage(
-  err: ServiceError,
-  sketchPath: string,
-  sketchbookPath: string | undefined
-): string {
-  if (!sketchbookPath) {
-    return err.details; // No way to repair the error message. The current sketchbook path is not available.
-  }
-  // Original: `Can't open sketch: no valid sketch found in /Users/a.kitta/Documents/Arduino: missing /Users/a.kitta/Documents/Arduino/Arduino.ino`
-  // Fixed: `Can't open sketch: no valid sketch found in /Users/a.kitta/Documents/Arduino: missing $sketchPath`
-  const message = err.details;
-  const incorrectMessageSuffix = path.join(sketchbookPath, 'Arduino.ino');
-  if (
-    message.startsWith("Can't open sketch: no valid sketch found in") &&
-    message.endsWith(`${incorrectMessageSuffix}`)
-  ) {
-    const sketchName = path.basename(sketchPath);
-    const correctMessagePrefix = message.substring(
-      0,
-      message.length - incorrectMessageSuffix.length
-    );
-    return `${correctMessagePrefix}${path.join(
-      sketchPath,
-      `${sketchName}.ino`
-    )}`;
-  }
-  return err.details;
 }
 
 function isNotFoundError(err: unknown): err is ServiceError {

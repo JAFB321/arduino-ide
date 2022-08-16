@@ -4,7 +4,7 @@ export const ExamplesServicePath = '/services/example-service';
 export const ExamplesService = Symbol('ExamplesService');
 export interface ExamplesService {
   builtIns(): Promise<SketchContainer[]>;
-  installed(options: { fqbn?: string }): Promise<{
+  installed(options: { fqbn?: string; forceRefresh?: boolean }): Promise<{
     user: SketchContainer[];
     current: SketchContainer[];
     any: SketchContainer[];

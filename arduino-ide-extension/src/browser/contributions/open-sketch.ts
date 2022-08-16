@@ -1,115 +1,44 @@
-import { inject, injectable } from '@theia/core/shared/inversify';
 import * as remote from '@theia/core/electron-shared/@electron/remote';
-import { MaybePromise } from '@theia/core/lib/common/types';
-import { Widget, ContextMenuRenderer } from '@theia/core/lib/browser';
-import {
-  Disposable,
-  DisposableCollection,
-} from '@theia/core/lib/common/disposable';
+import { nls } from '@theia/core/lib/common/nls';
+import { injectable } from '@theia/core/shared/inversify';
+import { SketchesError, SketchRef } from '../../common/protocol';
 import { ArduinoMenus } from '../menu/arduino-menus';
-import { ArduinoToolbar } from '../toolbar/arduino-toolbar';
 import {
-  SketchContribution,
-  Sketch,
-  URI,
   Command,
   CommandRegistry,
-  MenuModelRegistry,
   KeybindingRegistry,
+  MenuModelRegistry,
+  Sketch,
+  SketchContribution,
+  URI,
 } from './contribution';
-import { ExamplesService } from '../../common/protocol/examples-service';
-import { BuiltInExamples } from './examples';
-import { Sketchbook } from './sketchbook';
-import { SketchContainer } from '../../common/protocol';
-import { nls } from '@theia/core/lib/common';
+
+export type SketchLocation = string | URI | SketchRef;
+export namespace SketchLocation {
+  export function toUri(location: SketchLocation): URI {
+    if (typeof location === 'string') {
+      return new URI(location);
+    } else if (SketchRef.is(location)) {
+      return toUri(location.uri);
+    } else {
+      return location;
+    }
+  }
+  export function is(arg: unknown): arg is SketchLocation {
+    return typeof arg === 'string' || arg instanceof URI || SketchRef.is(arg);
+  }
+}
 
 @injectable()
 export class OpenSketch extends SketchContribution {
-  @inject(MenuModelRegistry)
-  protected readonly menuRegistry: MenuModelRegistry;
-
-  @inject(ContextMenuRenderer)
-  protected readonly contextMenuRenderer: ContextMenuRenderer;
-
-  @inject(BuiltInExamples)
-  protected readonly builtInExamples: BuiltInExamples;
-
-  @inject(ExamplesService)
-  protected readonly examplesService: ExamplesService;
-
-  @inject(Sketchbook)
-  protected readonly sketchbook: Sketchbook;
-
-  protected readonly toDispose = new DisposableCollection();
-
   override registerCommands(registry: CommandRegistry): void {
     registry.registerCommand(OpenSketch.Commands.OPEN_SKETCH, {
-      execute: (arg) =>
-        Sketch.is(arg) ? this.openSketch(arg) : this.openSketch(),
-    });
-    registry.registerCommand(OpenSketch.Commands.OPEN_SKETCH__TOOLBAR, {
-      isVisible: (widget) =>
-        ArduinoToolbar.is(widget) && widget.side === 'left',
-      execute: async (_: Widget, target: EventTarget) => {
-        const container = await this.sketchService.getSketches({
-          exclude: ['**/hardware/**'],
-        });
-        if (SketchContainer.isEmpty(container)) {
-          this.openSketch();
-        } else {
-          this.toDispose.dispose();
-          if (!(target instanceof HTMLElement)) {
-            return;
-          }
-          const { parentElement } = target;
-          if (!parentElement) {
-            return;
-          }
-
-          this.menuRegistry.registerMenuAction(
-            ArduinoMenus.OPEN_SKETCH__CONTEXT__OPEN_GROUP,
-            {
-              commandId: OpenSketch.Commands.OPEN_SKETCH.id,
-              label: nls.localize(
-                'vscode/workspaceActions/openFileFolder',
-                'Open...'
-              ),
-            }
-          );
-          this.toDispose.push(
-            Disposable.create(() =>
-              this.menuRegistry.unregisterMenuAction(
-                OpenSketch.Commands.OPEN_SKETCH
-              )
-            )
-          );
-          this.sketchbook.registerRecursively(
-            [...container.children, ...container.sketches],
-            ArduinoMenus.OPEN_SKETCH__CONTEXT__RECENT_GROUP,
-            this.toDispose
-          );
-          try {
-            const containers = await this.examplesService.builtIns();
-            for (const container of containers) {
-              this.builtInExamples.registerRecursively(
-                container,
-                ArduinoMenus.OPEN_SKETCH__CONTEXT__EXAMPLES_GROUP,
-                this.toDispose
-              );
-            }
-          } catch (e) {
-            console.error('Error when collecting built-in examples.', e);
-          }
-          const options = {
-            menuPath: ArduinoMenus.OPEN_SKETCH__CONTEXT,
-            anchor: {
-              x: parentElement.getBoundingClientRect().left,
-              y:
-                parentElement.getBoundingClientRect().top +
-                parentElement.offsetHeight,
-            },
-          };
-          this.contextMenuRenderer.render(options);
+      execute: async (arg) => {
+        const toOpen = !SketchLocation.is(arg)
+          ? await this.selectSketch()
+          : arg;
+        if (toOpen) {
+          return this.openSketch(toOpen);
         }
       },
     });
@@ -130,16 +59,23 @@ export class OpenSketch extends SketchContribution {
     });
   }
 
-  async openSketch(
-    toOpen: MaybePromise<Sketch | undefined> = this.selectSketch()
-  ): Promise<void> {
-    const sketch = await toOpen;
-    if (sketch) {
-      this.workspaceService.open(new URI(sketch.uri));
+  private async openSketch(toOpen: SketchLocation | undefined): Promise<void> {
+    if (!toOpen) {
+      return;
     }
+    const uri = SketchLocation.toUri(toOpen);
+    try {
+      await this.sketchService.loadSketch(uri.toString());
+    } catch (err) {
+      if (SketchesError.NotFound.is(err)) {
+        this.messageService.error(err.message);
+      }
+      throw err;
+    }
+    this.workspaceService.open(uri);
   }
 
-  protected async selectSketch(): Promise<Sketch | undefined> {
+  private async selectSketch(): Promise<Sketch | undefined> {
     const config = await this.configService.getConfiguration();
     const defaultPath = await this.fileService.fsPath(
       new URI(config.sketchDirUri)
@@ -216,9 +152,6 @@ export namespace OpenSketch {
   export namespace Commands {
     export const OPEN_SKETCH: Command = {
       id: 'arduino-open-sketch',
-    };
-    export const OPEN_SKETCH__TOOLBAR: Command = {
-      id: 'arduino-open-sketch--toolbar',
     };
   }
 }
