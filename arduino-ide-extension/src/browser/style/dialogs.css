@@ -85,3 +85,8 @@
         max-height: 400px;
     }
 }
+
+
+.p-Widget.dialogOverlay.workspace-input-dialog .dialogBlock  {
+    width: 480px;
+}
