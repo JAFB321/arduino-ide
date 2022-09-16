@@ -68,6 +68,7 @@ div#select-board-dialog .selectBoardContainer .list .item.selected i {
   display: flex;
   flex-direction: column;
   max-height: 100%;
+  height: 100%;
 }
 
 #select-board-dialog .selectBoardContainer .left.container .content {
@@ -136,6 +137,7 @@ div#select-board-dialog .selectBoardContainer .list .item.selected i {
 #select-board-dialog .selectBoardContainer .list {
   max-height: 200px;
   overflow-y: auto;
+  flex: 1;
 }
 
 #select-board-dialog .selectBoardContainer .ports.list {
